@@ -1,0 +1,29 @@
+.env
+data/reviews.db
+__pycache__/
+.streamlit/secrets.toml
+*.pyc
+.venv/
+venv/
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# OS files
+.DS_Store

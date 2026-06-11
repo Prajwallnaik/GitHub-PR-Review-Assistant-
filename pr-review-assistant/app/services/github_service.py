@@ -1,0 +1,339 @@
+import re
+import requests
+from typing import Optional
+from app.models.pr import PRFile, PRMetadata
+from app.models.review import ReviewResult
+from config.settings import REQUEST_TIMEOUT_SECONDS
+
+
+def extract_line_number(line_str: str) -> Optional[int]:
+    """Extract first sequence of digits as integer from line string."""
+    if not line_str:
+        return None
+    match = re.search(r'\d+', str(line_str))
+    if match:
+        return int(match.group(0))
+    return None
+
+
+def fetch_pr_data(owner: str, repo: str, pr_number: int, github_token: str) -> PRMetadata:
+    """
+    Fetch PR details and files from the GitHub REST API.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        pr_number: Pull request number.
+        github_token: GitHub personal access token.
+
+    Returns:
+        PRMetadata dataclass with full PR information and assembled diff.
+    """
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Fetch PR details
+    pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    pr_response = requests.get(pr_url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    pr_response.raise_for_status()
+    pr_data = pr_response.json()
+
+    # Fetch PR files
+    files_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
+    files_response = requests.get(files_url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    files_response.raise_for_status()
+    files_data = files_response.json()
+
+    # Build PRFile objects and assemble diff
+    pr_files = []
+    diff_parts = []
+
+    for f in files_data:
+        pr_file = PRFile(
+            filename=f.get("filename", ""),
+            status=f.get("status", ""),
+            additions=f.get("additions", 0),
+            deletions=f.get("deletions", 0),
+            patch=f.get("patch", ""),
+        )
+        pr_files.append(pr_file)
+
+        # Build diff header
+        diff_parts.append(
+            f"--- {pr_file.filename} [{pr_file.status}] "
+            f"(+{pr_file.additions}/-{pr_file.deletions})\n"
+            f"{pr_file.patch}\n"
+        )
+
+    combined_diff = "\n".join(diff_parts)
+
+    return PRMetadata(
+        title=pr_data.get("title", ""),
+        description=pr_data.get("body", "") or "",
+        author=pr_data.get("user", {}).get("login", ""),
+        created_at=pr_data.get("created_at", ""),
+        base_branch=pr_data.get("base", {}).get("ref", ""),
+        head_branch=pr_data.get("head", {}).get("ref", ""),
+        files_changed=len(pr_files),
+        total_additions=sum(f.additions for f in pr_files),
+        total_deletions=sum(f.deletions for f in pr_files),
+        files=pr_files,
+        diff=combined_diff,
+        head_sha=pr_data.get("head", {}).get("sha", ""),
+    )
+
+
+def post_review_comment(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    github_token: str,
+    review: ReviewResult,
+) -> Optional[dict]:
+    """
+    Post a formatted review comment to a GitHub PR.
+
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        pr_number: Pull request number.
+        github_token: GitHub personal access token.
+        review: The ReviewResult to format and post.
+
+    Returns:
+        The API response JSON, or None on failure.
+    """
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Build Markdown comment
+    lines = []
+    lines.append("## AI Code Review")
+    lines.append("")
+    lines.append(f"**Severity:** {review.severity.upper()}")
+    lines.append("")
+    lines.append(f"### Summary")
+    lines.append(review.summary)
+    lines.append("")
+
+    if review.bugs:
+        lines.append("### Bugs")
+        for bug in review.bugs:
+            lines.append(f"- **`{bug.file}` (L{bug.line}):** {bug.issue}")
+            lines.append(f"  - Fix: {bug.fix}")
+        lines.append("")
+
+    if review.edge_cases:
+        lines.append("### Edge Cases")
+        for ec in review.edge_cases:
+            lines.append(f"- {ec.description}")
+            lines.append(f"  - {ec.suggestion}")
+        lines.append("")
+
+    if review.optimizations:
+        lines.append("### Optimizations")
+        for opt in review.optimizations:
+            lines.append(f"- [{opt.impact.upper()}] {opt.description}")
+        lines.append("")
+
+    if review.security:
+        lines.append("### Security")
+        for sec in review.security:
+            lines.append(f"- {sec.issue}")
+            lines.append(f"  - Recommendation: {sec.recommendation}")
+        lines.append("")
+
+    if review.positives:
+        lines.append("### Positives")
+        for pos in review.positives:
+            lines.append(f"- {pos}")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("*Generated by AI Code Review Assistant*")
+
+    comment_body = "\n".join(lines)
+
+    # Post via issues comments endpoint
+    comment_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments"
+    response = requests.post(
+        comment_url,
+        headers=headers,
+        json={"body": comment_body},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        if response.status_code == 403:
+            raise Exception(
+                f"GitHub API Permission Denied (403). Your token may need additional scopes.\n"
+                f"Required scopes: 'repo' (or 'public_repo' for public repos).\n"
+                f"Get a new token: https://github.com/settings/tokens"
+            )
+        elif response.status_code == 404:
+            raise Exception(f"PR not found (404). Check the owner/repo/PR number.")
+        else:
+            raise Exception(f"GitHub API Error ({response.status_code}): {response.text}")
+    
+    return response.json()
+
+
+def post_inline_review_comments(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    github_token: str,
+    review: ReviewResult,
+    head_sha: str,
+) -> Optional[dict]:
+    """
+    Post a structured review with position-aware inline comments on specific diff lines.
+    Uses POST /repos/{owner}/{repo}/pulls/{pr_number}/reviews.
+    """
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    comments = []
+
+    # Map bugs to inline comments
+    for bug in review.bugs:
+        line_num = extract_line_number(bug.line)
+        if bug.file and line_num:
+            comments.append({
+                "path": bug.file,
+                "line": line_num,
+                "body": f"### Bug Found\n**Issue:** {bug.issue}\n**Suggested Fix:** {bug.fix}",
+                "side": "RIGHT"
+            })
+
+    # Build the main review body
+    lines = []
+    lines.append(f"## AI Code Review Assessment ({review.severity.upper()})")
+    lines.append(review.summary)
+    lines.append("")
+
+    if review.edge_cases:
+        lines.append("### Edge Cases")
+        for ec in review.edge_cases:
+            lines.append(f"- **{ec.description}**\n  - Suggestion: {ec.suggestion}")
+        lines.append("")
+
+    if review.optimizations:
+        lines.append("### Optimizations")
+        for opt in review.optimizations:
+            lines.append(f"- [{opt.impact.upper()}] {opt.description}")
+        lines.append("")
+
+    if review.security:
+        lines.append("### Security Findings")
+        for sec in review.security:
+            lines.append(f"- **{sec.issue}**\n  - Recommendation: {sec.recommendation}")
+        lines.append("")
+
+    if review.positives:
+        lines.append("### Positives")
+        for pos in review.positives:
+            lines.append(f"- {pos}")
+        lines.append("")
+
+    review_body = "\n".join(lines)
+
+    payload = {
+        "body": review_body,
+        "event": "COMMENT",
+    }
+    if head_sha:
+        payload["commit_id"] = head_sha
+    if comments:
+        payload["comments"] = comments
+
+    review_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
+    response = requests.post(
+        review_url,
+        headers=headers,
+        json=payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        if response.status_code == 403:
+            raise Exception(
+                f"GitHub API Permission Denied (403). Your token may need additional scopes.\n"
+                f"Required scopes: 'repo' (or 'public_repo' for public repos).\n"
+                f"Get a new token: https://github.com/settings/tokens"
+            )
+        elif response.status_code == 404:
+            raise Exception(f"PR not found (404). Check the owner/repo/PR number.")
+        elif response.status_code == 422:
+            raise Exception(
+                f"Invalid review data (422). The PR may already be merged or closed.\n"
+                f"Details: {response.text}"
+            )
+        else:
+            raise Exception(f"GitHub API Error ({response.status_code}): {response.text}")
+    
+    return response.json()
+
+
+def post_unified_review(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    github_token: str,
+    review: ReviewResult,
+    head_sha: str = "",
+) -> dict:
+    """
+    Post a unified review combining inline comments and summary in one go.
+    
+    This function:
+    1. Posts inline comments for bugs (if commit SHA is available)
+    2. Posts a comprehensive summary comment
+    
+    Args:
+        owner: Repository owner.
+        repo: Repository name.
+        pr_number: Pull request number.
+        github_token: GitHub personal access token.
+        review: The ReviewResult to post.
+        head_sha: Commit SHA for inline comments (optional).
+    
+    Returns:
+        Dictionary with 'inline_response' and 'summary_response' keys.
+    """
+    results = {}
+    
+    # Post inline review if we have the commit SHA
+    if head_sha:
+        try:
+            results["inline_response"] = post_inline_review_comments(
+                owner, repo, pr_number, github_token, review, head_sha
+            )
+            results["inline_posted"] = True
+        except Exception as e:
+            results["inline_error"] = str(e)
+            results["inline_posted"] = False
+    
+    # Always post summary comment
+    try:
+        results["summary_response"] = post_review_comment(
+            owner, repo, pr_number, github_token, review
+        )
+        results["summary_posted"] = True
+    except Exception as e:
+        results["summary_error"] = str(e)
+        results["summary_posted"] = False
+    
+    return results
+
+
