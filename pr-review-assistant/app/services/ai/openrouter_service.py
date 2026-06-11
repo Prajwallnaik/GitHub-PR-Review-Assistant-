@@ -16,20 +16,28 @@ class OpenRouterService(BaseAIService):
     """AI review service using OpenRouter (OpenAI-compatible)."""
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
+        from config.settings import PER_FILE_ANALYSIS_ENABLED, PER_FILE_ANALYSIS_MODE
+        
         self.client = OpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=api_key,
         )
         self.model = model
+        self.per_file_analysis_enabled = PER_FILE_ANALYSIS_ENABLED
+        self.per_file_analysis_mode = PER_FILE_ANALYSIS_MODE
 
     def review(self, pr_metadata: PRMetadata, prompt: str) -> ReviewResult:
         """
         Send the PR diff to the AI model and parse the structured JSON response.
 
         Includes retry logic: up to 3 attempts with 2-second delay for rate limits.
+        Per-file analysis is enabled dynamically based on PR size and configuration.
         """
         # Build user message with PR context
         user_message = self._build_user_message(pr_metadata)
+        
+        # Dynamically enable per-file analysis based on PR size
+        analysis_prompt = self._enhance_prompt_with_per_file_analysis(prompt, pr_metadata)
 
         last_error = None
         for attempt in range(3):
@@ -37,11 +45,12 @@ class OpenRouterService(BaseAIService):
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": prompt},
+                        {"role": "system", "content": analysis_prompt},
                         {"role": "user", "content": user_message},
                     ],
                     temperature=0.3,
                     max_tokens=4096,
+                    extra_headers={"HTTP-Referer": "pr-review-assistant", "X-Title": "PR Review Assistant"},
                 )
 
                 raw_content = response.choices[0].message.content
@@ -79,8 +88,11 @@ class OpenRouterService(BaseAIService):
         raise last_error
 
     def review_stream(self, pr_metadata: PRMetadata, prompt: str):
-        """Stream the review response chunk-by-chunk."""
+        """Stream the review response chunk-by-chunk with dynamic per-file analysis."""
         user_message = self._build_user_message(pr_metadata)
+        
+        # Dynamically enable per-file analysis based on PR size
+        analysis_prompt = self._enhance_prompt_with_per_file_analysis(prompt, pr_metadata)
 
         last_error = None
         for attempt in range(3):
@@ -88,12 +100,13 @@ class OpenRouterService(BaseAIService):
                 response_stream = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": prompt},
+                        {"role": "system", "content": analysis_prompt},
                         {"role": "user", "content": user_message},
                     ],
                     temperature=0.3,
                     max_tokens=4096,
                     stream=True,
+                    extra_headers={"HTTP-Referer": "pr-review-assistant", "X-Title": "PR Review Assistant"},
                 )
                 for chunk in response_stream:
                     content = chunk.choices[0].delta.content
@@ -133,6 +146,44 @@ class OpenRouterService(BaseAIService):
                 raise
 
         raise last_error
+
+    def _enhance_prompt_with_per_file_analysis(self, base_prompt: str, pr_metadata: PRMetadata) -> str:
+        """
+        Dynamically enhance the prompt with per-file analysis directives.
+        
+        Determines if per-file analysis should be enabled based on:
+        - Configuration mode (always, auto, disabled)
+        - PR size (number of changed files)
+        - Diff size (characters in diff)
+        """
+        from config.settings import PER_FILE_ANALYSIS_AUTO_THRESHOLD
+        
+        # Determine if per-file analysis should be active
+        should_enable = self.per_file_analysis_enabled
+        
+        if self.per_file_analysis_mode == "disabled":
+            should_enable = False
+        elif self.per_file_analysis_mode == "auto":
+            # Automatically enable for larger PRs
+            diff_size = len(pr_metadata.diff)
+            is_large_pr = diff_size > PER_FILE_ANALYSIS_AUTO_THRESHOLD
+            should_enable = is_large_pr or pr_metadata.files_changed > 3
+        
+        # Add per-file analysis directives to the prompt
+        if should_enable:
+            per_file_directive = (
+                "\n\n### Per-File Analysis Mode (ENABLED)\n"
+                "Analyze each modified file individually. For each file:\n"
+                "1. Identify the file's purpose and context\n"
+                "2. Review changes specific to that file\n"
+                "3. Check for file-specific issues (imports, dependencies, style)\n"
+                "4. Consider how changes affect file functionality\n"
+                "Then provide holistic review across all files."
+            )
+            return base_prompt + per_file_directive
+        else:
+            per_file_directive = "\n\n### Per-File Analysis Mode (DISABLED)\nProvide a general holistic review of all changes."
+            return base_prompt + per_file_directive
 
     def _build_user_message(self, pr_metadata: PRMetadata) -> str:
         """Assemble the user message from PR metadata fields."""
