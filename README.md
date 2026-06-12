@@ -1,4 +1,4 @@
-# AI PR Review Assistant
+# GitHub PR Review Assistant
 
 <div align="center">
 
