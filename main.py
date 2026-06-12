@@ -176,9 +176,16 @@ FOCUS_PROMPT_MAP = {
 # ---------------------------------------------------------------------------
 config = render_sidebar()
 
-# Use env vars as fallback
-github_token = config["github_token"] or os.getenv("GITHUB_TOKEN", "")
-openrouter_key = config["openrouter_api_key"] or os.getenv("OPENROUTER_API_KEY", "")
+# Load tokens and keys from environment
+github_token = os.getenv("GITHUB_TOKEN", "")
+ai_provider = config["ai_provider"]
+ai_api_key = ""
+if ai_provider == "openrouter":
+    ai_api_key = os.getenv("OPENROUTER_API_KEY", "")
+elif ai_provider == "gemini":
+    ai_api_key = os.getenv("GEMINI_API_KEY", "")
+
+
 
 # ---------------------------------------------------------------------------
 # History sidebar section
@@ -212,7 +219,7 @@ st.markdown(
     f"""
     <div class="main-header">
         <h1>{APP_TITLE}</h1>
-        <p>Paste a GitHub PR URL and get an instant senior-engineer-level code review</p>
+        <p>Paste a GitHub PR URL and get an instant code review</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -337,9 +344,11 @@ if review_clicked:
     if not pr_url.strip():
         st.error("Please enter a GitHub PR URL.")
     elif not github_token:
-        st.error("GitHub token is required. Enter it in the sidebar or set GITHUB_TOKEN in .env")
-    elif not openrouter_key:
-        st.error("OpenRouter API key is required. Enter it in the sidebar or set OPENROUTER_API_KEY in .env")
+        st.error("GitHub token is required. Please set GITHUB_TOKEN in your .env file.")
+    elif not ai_api_key:
+        provider_name = "OpenRouter" if ai_provider == "openrouter" else "Gemini"
+        env_var_name = "OPENROUTER_API_KEY" if ai_provider == "openrouter" else "GEMINI_API_KEY"
+        st.error(f"{provider_name} API key is required. Please set {env_var_name} in your .env file.")
     else:
         try:
             # 1. Parse URL
@@ -358,7 +367,7 @@ if review_clicked:
             system_prompt = prompt_fn()
 
             # 4. Get AI service
-            ai_service = get_ai_service("openrouter", openrouter_key)
+            ai_service = get_ai_service(ai_provider, ai_api_key, model=config["model"])
 
             # Determine if per-file is triggered
             is_per_file = False
@@ -448,7 +457,7 @@ if review_clicked:
             if "OpenRouter Account Out of Credits" in error_msg or "402" in error_msg:
                 st.error(error_msg)
                 st.info(
-                    "**💡 Quick Fix:**\n\n"
+                    "**Quick Fix:**\n\n"
                     "1. Visit [OpenRouter Credits](https://openrouter.ai/settings/credits)\n"
                     "2. Look for free credits or add a payment method\n"
                     "3. Generate a new API key if using a paid account\n"
@@ -479,7 +488,7 @@ if st.session_state["current_review"] and st.session_state["current_pr_meta"]:
     
     with col_quick:
         if st.button(
-            "🚀 Post Review to GitHub PR",
+            "Post Review to GitHub PR",
             use_container_width=True,
             help="Post both inline comments and summary review to the GitHub PR with one click",
         ):
@@ -499,14 +508,14 @@ if st.session_state["current_review"] and st.session_state["current_pr_meta"]:
                 error_items = []
                 
                 if post_results.get("inline_posted"):
-                    success_items.append("✅ Inline comments posted")
+                    success_items.append("Inline comments posted successfully.")
                 elif post_results.get("inline_posted") is False and post_results.get("inline_error"):
-                    error_items.append(f"⚠️ Inline comments: {post_results.get('inline_error', 'Unknown error')}")
+                    error_items.append(f"Inline comments error: {post_results.get('inline_error', 'Unknown error')}")
                 
                 if post_results.get("summary_posted"):
-                    success_items.append("✅ Summary comment posted")
+                    success_items.append("Summary comment posted successfully.")
                 elif post_results.get("summary_posted") is False and post_results.get("summary_error"):
-                    error_items.append(f"❌ Summary: {post_results.get('summary_error', 'Unknown error')}")
+                    error_items.append(f"Summary error: {post_results.get('summary_error', 'Unknown error')}")
                 
                 # Display results
                 if success_items:
@@ -527,7 +536,7 @@ if st.session_state["current_review"] and st.session_state["current_pr_meta"]:
                 # Provide helpful suggestion for 403 errors
                 if "403" in error_msg or "Forbidden" in error_msg:
                     st.info(
-                        "**💡 Fix this error:**\n\n"
+                        "**Fix this error:**\n\n"
                         "Your GitHub token needs the `repo` scope to post comments.\n\n"
                         "1. Go to [GitHub Settings → Tokens](https://github.com/settings/tokens)\n"
                         "2. Create a new token with `repo` scope\n"
@@ -619,10 +628,10 @@ if st.session_state["current_review"] and st.session_state["current_pr_meta"]:
 
     # 6. Action/Export Section
     st.markdown("---")
-    st.markdown("### Additional Export & Options")
-    st.caption("Use the 'Post Review to GitHub PR' button above to post with one click, or export/post individually below:")
+    st.markdown("### Export Options")
+    st.caption("Download the generated review for local use:")
 
-    col_exp1, col_exp2, col_exp3, col_exp4 = st.columns(4)
+    col_exp1, col_exp2 = st.columns(2)
 
     with col_exp1:
         json_export = export_as_json(review_result, pr_meta)
@@ -643,38 +652,6 @@ if st.session_state["current_review"] and st.session_state["current_pr_meta"]:
             mime="text/markdown",
             use_container_width=True,
         )
-
-    with col_exp3:
-        if st.button("Post Summary Comment", use_container_width=True):
-            try:
-                post_review_comment(owner, repo, pr_number, github_token, review_result)
-                st.success("Summary comment posted to PR!")
-            except Exception as e:
-                st.error(f"Failed to post comment: {str(e)[:200]}")
-                if "403" in str(e):
-                    st.caption("💡 Your GitHub token needs `repo` scope. [Get a new token](https://github.com/settings/tokens)")
-
-
-    with col_exp4:
-        if pr_meta.head_sha:
-            if st.button("Post Inline Review", use_container_width=True):
-                try:
-                    post_inline_review_comments(
-                        owner, repo, pr_number, github_token, review_result, pr_meta.head_sha
-                    )
-                    st.success("Position-aware inline review posted to GitHub!")
-                except Exception as e:
-                    st.error(f"Failed to post inline review: {str(e)[:200]}")
-                    if "403" in str(e):
-                        st.caption("💡 Your GitHub token needs `repo` scope. [Get a new token](https://github.com/settings/tokens)")
-        else:
-            st.button(
-                "Post Inline Review (N/A)",
-                disabled=True,
-                use_container_width=True,
-                help="Commit SHA not available (only for live reviews, not historical)"
-            )
-            st.caption("💡 Available only for live PR reviews, not for historical reviews")
 
 
 
